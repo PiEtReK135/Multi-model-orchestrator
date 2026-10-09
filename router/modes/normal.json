@@ -1,0 +1,3 @@
+{ "description": "Production T2-T3. Opus only for arbitration, architecture and risky tasks. Weak results auto-escalate the task to senior.",
+  "production": [2, 3], "opus": true, "t5": false,
+  "planner": "sonnet", "judge": "sonnet", "cross_judge": "always", "retries": 2, "drift_interval": 10, "parallel": 3, "question_threshold": 0.5 }

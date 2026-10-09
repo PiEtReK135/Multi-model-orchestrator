@@ -1,0 +1,156 @@
+{
+  "_comment": "Tier -> model per provider. Executors: codex (ChatGPT subscription), agy (Antigravity CLI, Google account), free (patch-only: free API models via local LiteLLM return SEARCH/REPLACE blocks). gemini CLI kept but not in the order (API-key free tier, 20 req/day). Models verified 2026-10-09 (codex models_cache, `agy models`, `router free check`).",
+  "codex": {
+    "T1": {
+      "model": "gpt-6-luna",
+      "effort": "low"
+    },
+    "T2": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    "T3": {
+      "model": "gpt-6-astra",
+      "effort": "high"
+    }
+  },
+  "gemini": {
+    "T1": {
+      "model": "gemini-3.5-flash-lite"
+    },
+    "T2": {
+      "model": "gemini-3.8-flash"
+    }
+  },
+  "claude": {
+    "T1": "haiku",
+    "orchestrator": "sonnet",
+    "T4": "opus",
+    "T5": "fable"
+  },
+  "prefer": {
+    "code": [
+      "free",
+      "codex",
+      "agy"
+    ],
+    "docs": [
+      "free",
+      "agy",
+      "codex"
+    ],
+    "creative": [
+      "agy",
+      "free",
+      "codex"
+    ]
+  },
+  "gemini_T3_when_google_login": {
+    "model": "gemini-3.1-pro-preview"
+  },
+  "free": {
+    "T1": {
+      "model": "free-t1"
+    },
+    "T2": {
+      "model": "free-t2"
+    },
+    "T3": {
+      "model": "free-t3"
+    }
+  },
+  "free_pool": {
+    "free-t1": [
+      {
+        "model": "groq/openai/gpt-oss-20b",
+        "key": "GROQ_API_KEY",
+        "rpm": 30
+      },
+      {
+        "model": "openai/@cf/openai/gpt-oss-20b",
+        "key": "CLOUDFLARE_API_KEY",
+        "rpm": 30,
+        "env": [
+          "CLOUDFLARE_ACCOUNT_ID"
+        ],
+        "api_base": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+      },
+      {
+        "model": "gemini/gemma-4-31b-it",
+        "key": "GEMINI_API_KEY",
+        "rpm": 30
+      },
+      {
+        "model": "openrouter/nvidia/nemotron-3.5-lightning:free",
+        "key": "OPENROUTER_API_KEY",
+        "rpm": 20
+      },
+      {
+        "model": "cerebras/gpt-oss-120b",
+        "key": "CEREBRAS_API_KEY",
+        "rpm": 30
+      }
+    ],
+    "free-t2": [
+      {
+        "model": "mistral/codestral-latest",
+        "key": "MISTRAL_API_KEY",
+        "rpm": 100
+      },
+      {
+        "model": "groq/openai/gpt-oss-120b",
+        "key": "GROQ_API_KEY",
+        "rpm": 30
+      },
+      {
+        "model": "openai/@cf/openai/gpt-oss-120b",
+        "key": "CLOUDFLARE_API_KEY",
+        "rpm": 30,
+        "env": [
+          "CLOUDFLARE_ACCOUNT_ID"
+        ],
+        "api_base": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+      },
+      {
+        "model": "openrouter/cohere/north-mini-code:free",
+        "key": "OPENROUTER_API_KEY",
+        "rpm": 20
+      },
+      {
+        "model": "openrouter/poolside/laguna-s-2.1:free",
+        "key": "OPENROUTER_API_KEY",
+        "rpm": 20
+      }
+    ],
+    "free-t3": [
+      {
+        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        "key": "OPENROUTER_API_KEY",
+        "rpm": 20
+      },
+      {
+        "model": "mistral/codestral-latest",
+        "key": "MISTRAL_API_KEY",
+        "rpm": 100
+      }
+    ]
+  },
+  "prefer_tier": {
+    "T3": [
+      "codex",
+      "agy",
+      "free"
+    ]
+  },
+  "agy": {
+    "T1": {
+      "model": "gemini-3.8-flash-low"
+    },
+    "T2": {
+      "model": "gemini-3.8-flash-medium"
+    },
+    "T3": {
+      "model": "gemini-3.1-pro-high"
+    }
+  }
+}

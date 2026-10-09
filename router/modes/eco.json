@@ -1,0 +1,3 @@
+{ "description": "Claude plans (Sonnet) and reads diffs, no Opus. Production T1-T2, T3 only for difficulty >= 0.8.",
+  "production": [1, 2], "t3_min_difficulty": 0.8, "opus": false, "t5": false,
+  "planner": "sonnet", "judge": "sonnet", "cross_judge": "risk", "retries": 1, "drift_interval": 15, "parallel": 2, "question_threshold": 0.7 }
