@@ -89,34 +89,67 @@ Manual CLI (from project root): `node "$HOME/.claude/router/router.mjs" <cmd>`
 | `accept <id>` / `reject <id>` | squash-merge (staged) / discard worktree |
 | `scan <paths> [--text s]` | secret scanner (exit 3 = found) |
 | `mode [name]`, `usage`, `stats`, `doctor [--probe]` | status, per-provider usage, learning proposals, health |
+| `graph`, `research "<q>"`, `digest <files>` | knowledge graph / web research / document digests without Claude tokens |
+| `learn [--import dir]`, `lesson list|add|rm` | learned calibration / living executor instructions |
 
 ## Executors, tiers and models (`router/providers.json`)
 
-| Executor | How it works | Runs commands? |
-|---|---|---|
-| `codex` | Codex CLI agent (ChatGPT subscription) inside the worktree, `--sandbox workspace-write`; on Windows falls back to the unelevated sandbox for 24h if the elevated helper fails (`codex doctor`) | yes, sandboxed (writes only in worktree/temp) |
-| `agy` | Antigravity CLI (official, Google account) in **patch mode**: read-only `--mode plan`, returns SEARCH/REPLACE blocks | no |
-| `free` | free API models through a local LiteLLM proxy in **patch mode** | no |
-| `claude` | done by Claude in the session (secrets, confidential, T4/T5) | session rules |
-
-Patch mode: the model gets the card + the current content of the allowed files and replies only with
-SEARCH/REPLACE blocks; the router applies them to allowed files only (one automatic repair round for blocks that
-did not match), retries start from a clean `HEAD`, and Claude verifies (L0 tests, L1 criteria). External models
-never execute anything on this machine.
+| Executor | How it works | Runs commands? | Cost to you |
+|---|---|---|---|
+| `free` | free API models through a local LiteLLM proxy, **patch mode** (SEARCH/REPLACE blocks) | no | free tiers |
+| `agy` | Antigravity CLI (Google account), read-only `--mode plan`, **patch mode**; also web research and digests | no | Google quota (cheap) |
+| `codex` | Codex CLI agent in the worktree, sandboxed (can run tests) | yes, sandboxed | ChatGPT quota (most expensive) |
+| `claude` | Claude itself (secrets, confidential, T4/T5) | session rules | Claude quota |
 
 | Tier | codex | agy | free (LiteLLM group) | claude |
 |---|---|---|---|---|
-| T0 | ripgrep, graphify, tests, router rules | | | |
-| T1 | gpt-6-luna (low) | gemini-3.8-flash-low | free-t1 | haiku (fallback) |
+| T0 | ripgrep, graphify (AST + `graphify query`), tests, router rules | | | |
+| T1 | gpt-6-luna (low) | gemini-3.8-flash-low | free-t1 | haiku |
 | T2 | gpt-6.1-sol (medium) | gemini-3.8-flash-medium | free-t2 | |
-| T3 | gpt-6-astra (high) | gemini-3.1-pro-high | free-t3 | |
-| T4 | | | | opus (architecture, security, arbitration, canon, secrets with risk) |
-| T5 | | | | fable (senior mode only) |
+| T3 | gpt-6.1-sol (high); **gpt-6-astra only** after a T3 failure, difficulty ≥ 0.9 or `senior` | gemini-3.1-pro-high | free-t3 | |
+| T4 | | | | opus |
+| T5 | | | | top model (`senior` only) |
 
-Order: code `free -> codex -> agy`, docs `free -> agy -> codex`, creative `agy -> free -> codex`; T3 always
-`codex -> agy -> free`. Failures escalate (2 per tier, `normal` -> `senior`), and the next executor avoids the one
-that failed. Providers in cooldown (rate limit) or unhealthy (`health.json`, `router doctor --probe`) are skipped for 6h.
-Gemini CLI is not in the order (API-key free tier, 20 req/day); Antigravity replaces it.
+Order (Antigravity is always cheaper than Codex, so it comes first; free first where quality allows):
+
+| kind | T1 | T2 | T3 |
+|---|---|---|---|
+| code | free → agy → codex | free → agy → codex | agy → codex → free |
+| general | free → agy → codex | agy → free → codex | agy → codex → free |
+| creative | agy → free → codex | agy → free → codex | agy → codex → free |
+
+On top of the order, the router **spreads load** over all available executors by 24h weighted token use
+(`budget_weight`: codex 1, agy 4, free 6, from a global ledger shared by all projects), skips providers in cooldown or
+unhealthy (`health.json`), and the next attempt after a failure avoids the executor that failed.
+
+**Token diet for Codex**: every call runs without connectors, plugins, browser, multi-agent and web search tool schemas
+(fixed overhead per model call measured 15.1k → 9.0k tokens), and the prompt keeps it inside the listed files with a
+≤120-word summary. **Patch mode** gives the model the card + the allowed files' content; the router applies blocks to
+allowed files only (one repair round), retries start from a clean `HEAD`, Claude verifies.
+
+## Estimation and learning
+
+- **Rules (T0)**: type → tier; `difficulty ≥ 0.7` → T3, `≤ 0.25` → T1; size counts only for code (≥ 5 files or
+  > 1500 lines → T3); risk keywords → T3 + Opus review.
+- **Learned calibration** from a global outcome ledger (`~/.claude/router/outcomes.jsonl`, every verdict from every
+  project): per task kind + type, first-try pass rate per tier. Down one tier when the lower tier passes ≥ 80% of
+  ≥ 5 similar tasks (may go below the mode's floor), up one tier when the current tier passes < 50% of ≥ 4; occasional
+  downward exploration for low-risk tasks that always pass. `config.learning`: `auto` (default) | `propose` | `off`.
+  `router learn` shows the table; `router learn --import <project>/.router` backfills older projects.
+- **Playbooks (living instructions)**: when a verdict fails, Claude records one general lesson
+  (`router next <id> --verdict fail --lesson "..."`). Lessons are deduplicated and counted per executor + kind, and the
+  top 8 are injected into that executor's future prompts. `router lesson list|add|rm`. Generic starter lessons ship in
+  `router/playbooks.default.json`.
+
+## Research, documents and the knowledge graph (no Claude tokens)
+
+- `router graph`: AST graph of all code in the project (`graphify update .`, no LLM). When a card has no `context`,
+  `exec` attaches a trimmed `graphify query` result automatically. `--semantic` tries a docs graph through the free
+  pool (experimental: free tiers reject PDF page images or hit per-minute token limits), so documents go through digests.
+- `router research "<question>" [--deep]`: Antigravity searches the web and answers in ≤ 250 words with source URLs;
+  saved to `.router/research/`.
+- `router digest <files> --focus "..."`: Antigravity reads PDFs/docx/datasheets and writes a ≤ 400-word digest with
+  page/section references; saved to `.router/digests/`. Claude reads digests, never the originals.
 
 ## Free pool (`free` executor): LiteLLM over official free API tiers
 

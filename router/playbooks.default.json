@@ -1,0 +1,37 @@
+[
+  {
+    "executor": "free",
+    "kind": "code",
+    "text": "Append new test methods at the end of the test class; never insert lines inside an existing method.",
+    "n": 1,
+    "ts": "2026-10-09T00:00:00.000Z"
+  },
+  {
+    "executor": "free",
+    "kind": "code",
+    "text": "Change only what the task asks; never delete or rewrite existing code you were not asked to touch.",
+    "n": 1,
+    "ts": "2026-10-09T00:00:00.000Z"
+  },
+  {
+    "executor": "all",
+    "kind": "general",
+    "text": "Use project-specific facts from the provided files; no generic placeholder rows: every row cites a concrete project source.",
+    "n": 1,
+    "ts": "2026-10-09T00:00:00.000Z"
+  },
+  {
+    "executor": "all",
+    "kind": "general",
+    "text": "Every pass/fail criterion and limit needs a number with a unit.",
+    "n": 1,
+    "ts": "2026-10-09T00:00:00.000Z"
+  },
+  {
+    "executor": "free",
+    "kind": "all",
+    "text": "Create every file the task lists as output; an empty SEARCH block creates a file.",
+    "n": 1,
+    "ts": "2026-10-09T00:00:00.000Z"
+  }
+]

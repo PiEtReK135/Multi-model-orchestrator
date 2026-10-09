@@ -25,7 +25,7 @@ Step 'CLIs from official channels (pinned where it matters)'
 npm install -g ecc-universal@2.2.3 @openai/codex   # ECC catalog (skills/agents/rules) + Codex CLI
 WingetInstall 'Gitleaks.Gitleaks' 'gitleaks'          # secret gate before anything leaves the machine
 WingetInstall 'BurntSushi.ripgrep.MSVC' 'rg'
-if (-not (Have 'graphify')) { uv tool install graphifyy }
+if (-not (Have 'graphify')) { uv tool install graphifyy --with openai }   # openai: docs graph via the free pool
 graphify install --platform claude                    # /graphify skill for Claude Code
 if (-not $SkipFreePool) {
   # never 1.82.7 / 1.82.8 (compromised releases); 1.102.1 includes the 2026 CVE fixes

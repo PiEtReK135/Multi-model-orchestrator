@@ -22,30 +22,54 @@ Claude (orkiestrator, Sonnet)
   6. router next   → pass: merge | fail: poprawka → eskalacja → "best effort" z listą otwartych punktów
 ```
 
-**Wykonawcy**
+**Wykonawcy** (od najtańszego)
 
 | Wykonawca | Co robi | Uruchamia polecenia? |
 |---|---|---|
-| `free` | darmowe modele przez lokalne proxy LiteLLM; zwracają **patche** (bloki SEARCH/REPLACE) | nie |
-| `agy` | Antigravity (Gemini 3.8 Flash / 3.1 Pro) w trybie tylko-odczyt; zwraca **patche** | nie |
-| `codex` | agent Codex w worktree, w sandboxie (zapis tylko w worktree) | tak, w sandboxie |
+| `free` | darmowe modele API (Groq, Cloudflare, Mistral Codestral, OpenRouter, Gemma) przez lokalne proxy LiteLLM; zwracają **patche** | nie |
+| `agy` | Antigravity (Gemini 3.8 Flash / 3.1 Pro), tylko-odczyt; zwraca **patche**; robi też research w sieci i streszczenia dokumentów | nie |
+| `codex` | agent Codex w worktree, w sandboxie; jedyny, który sam uruchamia testy | tak, w sandboxie |
 | `claude` | sam Claude: sekrety, projekty poufne, architektura, arbitraż | — |
 
 **Poziomy (domyślny tryb `normal`)**
 
-| Poziom | Typy zadań (pole `type`) | Kto |
+| Poziom | Typy zadań (pole `type`) | Modele |
 |---|---|---|
-| T1 | lookup, summarize, triage, format, trivial | free → codex (luna) |
-| T2 | implement, test, docs, debug, write, draft | free → codex/agy |
-| T3 | feature, refactor, hard-debug, analysis, long-write, worldbuilding, lub `difficulty ≥ 0.7`, lub ≥ 4 pliki, lub słowa ryzyka | codex (gpt-6-astra) → agy (3.1 Pro) → free |
+| T1 | lookup, summarize, triage, format, trivial, lub `difficulty ≤ 0.25` | free-t1 / Gemini Flash low / gpt-6-luna |
+| T2 | implement, test, docs, debug, write, draft, analysis, research | free-t2 / Gemini Flash medium / gpt-6.1-sol medium |
+| T3 | feature, refactor, hard-debug, long-write, worldbuilding, lub `difficulty ≥ 0.7`, lub kod ≥ 5 plików / > 1500 linii, lub słowa ryzyka | Gemini 3.1 Pro / gpt-6.1-sol **high**; `gpt-6-astra` tylko po porażce na T3, przy trudności ≥ 0.9 albo w `senior` |
 | T4 | architecture, security-review, arbitration, canon-change, sekrety | Claude Opus |
 | T5 | tylko tryb `senior` | najmocniejszy Claude |
 
-Kolejność wykonawców: kod `free → codex → agy`, zadania ogólne `free → agy → codex`, kreatywne `agy → free → codex`.
+**Kolejność** (Antigravity zawsze przed Codexem, bo jest tańszy):
+
+| rodzaj | T1 | T2 | T3 |
+|---|---|---|---|
+| kod | free → agy → codex | free → agy → codex | agy → codex → free |
+| ogólne | free → agy → codex | agy → free → codex | agy → codex → free |
+| kreatywne | agy → free → codex | agy → free → codex | agy → codex → free |
+
+Dodatkowo router **rozkłada obciążenie**: liczy zużycie tokenów z ostatnich 24 h we wszystkich projektach (z wagami
+pojemności: codex 1, agy 4, free 6) i gdy pierwszy w kolejce jest wyraźnie bardziej obciążony, bierze następnego.
 Dostawca z limitem albo niezdrowy jest pomijany automatycznie.
 
 **Eskalacja:** 2 porażki na poziomie → poziom wyżej, a w trybie `normal` zadanie przechodzi na `senior`. Następna
 próba omija wykonawcę, który zawiódł. Każda porażka dopisuje do promptu konkretne niespełnione kryteria.
+
+**Uczenie się:** każdy werdykt trafia do globalnego dziennika (wszystkie projekty). Dla danego rodzaju i typu zadania
+router liczy, jak często poziom zdaje za pierwszym razem: zjeżdża poziom niżej, gdy tańszy zdaje ≥ 80% z ≥ 5 podobnych
+zadań, i podnosi poziom, gdy obecny zdaje < 50% z ≥ 4. Powód widać w `reasons` decyzji („learned: ...”).
+`R learn` pokazuje tabelę; w `.router/config.json` `"learning": "propose"` wyłącza automat (tylko propozycje).
+
+**Playbooki (żywe instrukcje agentów):** gdy Claude odrzuca wynik, zapisuje jedną ogólną lekcję
+(`--lesson "Dopisuj nowe testy na końcu klasy"`). Lekcje są liczone i deduplikowane per wykonawca i rodzaj, a 8
+najczęstszych trafia do kolejnych promptów tego wykonawcy. Błędy powtarzają się więc coraz rzadziej.
+`R lesson list` / `R lesson rm <n>` do porządków.
+
+**Oszczędzanie tokenów Claude'a:** orkiestrator na Sonnecie; subagenci zawsze z jawnym modelem (Haiku do szukania,
+Sonnet do recenzji, Opus tylko T4/senior); research w sieci (`R research`) i duże dokumenty (`R digest`) robi
+Antigravity, a Claude czyta tylko gotowe notatki; graf kodu (`R graph`) powstaje bez LLM, a karty dostają wycinek
+z `graphify query` automatycznie.
 
 ---
 
@@ -61,7 +85,8 @@ opcjonalnie Antigravity i klucze z `.env.example` (szczegóły w README). W każ
    - czy projekt jest **poufny** (`confidential`: wtedy nic nie wychodzi poza Claude'a);
    - komendy **testów / lintera / builda** (dla `code`).
 3. Init tworzy `.router/` (konfiguracja, karty, logi), `.router/prompts/` (Twoje wytyczne), dopisuje sekcję do
-   `CLAUDE.md`, kopiuje reguły ECC dla stacku i buduje graf wiedzy (graphify).
+   `CLAUDE.md` i kopiuje reguły ECC dla stacku. Potem `R graph` buduje graf kodu (AST, bez LLM), a duże źródła
+   (PDF, regulaminy, datasheety) raz przepuszczasz przez `R digest`.
 4. Zrób commit. Wykonawcy startują od `HEAD` i nie widzą niezacommitowanych zmian.
 5. (Opcjonalnie, ale warto) uzupełnij `.router/prompts/*.md` — patrz rozdział 4.
 
@@ -241,6 +266,10 @@ Zmiany robisz w sklonowanym repo, potem `node router/router.mjs install`.
 | `R next <id> --verdict pass\|fail --notes "a; b"` | werdykt i decyzja co dalej |
 | `R accept <id>` / `R reject <id>` | merge (staged, bez commita) / odrzucenie |
 | `R usage` / `R stats` | zużycie per dostawca / skuteczność per typ-poziom-wykonawca + propozycje zmian reguł |
+| `R graph` | graf kodu projektu (AST, bez LLM) |
+| `R research "pytanie" [--deep]` | research w sieci przez Antigravity, ze źródłami, zapis w .router/research/ |
+| `R digest <pliki> --focus "..."` | streszczenie dużych dokumentów przez Antigravity, zapis w .router/digests/ |
+| `R learn` / `R lesson list` | czego router się nauczył / lekcje w playbookach |
 
 ---
 

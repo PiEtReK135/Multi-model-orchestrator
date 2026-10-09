@@ -1,5 +1,5 @@
 {
-  "_comment": "Tier -> model per provider. Executors: codex (ChatGPT subscription), agy (Antigravity CLI, Google account), free (patch-only: free API models via local LiteLLM return SEARCH/REPLACE blocks). gemini CLI kept but not in the order (API-key free tier, 20 req/day). Models verified 2026-10-09 (codex models_cache, `agy models`, `router free check`).",
+  "_comment": "Tier -> model per executor. codex: agent in a sandboxed worktree (ChatGPT subscription); T3 uses gpt-6.1-sol high, the frontier gpt-6-astra (T3_hard) only after a T3 failure, difficulty >= 0.9 or senior mode. agy: Antigravity CLI (Google account), patch mode. free: LiteLLM pool, patch mode. prefer: order per task kind and tier (Antigravity is always cheaper than Codex, so agy comes before codex; free first where quality allows). budget_weight: relative capacity for 24h token balancing (higher = can take more). Verified 2026-10-09.",
   "codex": {
     "T1": {
       "model": "gpt-6-luna",
@@ -10,6 +10,10 @@
       "effort": "medium"
     },
     "T3": {
+      "model": "gpt-6.1-sol",
+      "effort": "high"
+    },
+    "T3_hard": {
       "model": "gpt-6-astra",
       "effort": "high"
     }
@@ -29,21 +33,57 @@
     "T5": "fable"
   },
   "prefer": {
-    "code": [
-      "free",
-      "codex",
-      "agy"
-    ],
-    "docs": [
-      "free",
-      "agy",
-      "codex"
-    ],
-    "creative": [
-      "agy",
-      "free",
-      "codex"
-    ]
+    "code": {
+      "T1": [
+        "free",
+        "agy",
+        "codex"
+      ],
+      "T2": [
+        "free",
+        "agy",
+        "codex"
+      ],
+      "T3": [
+        "agy",
+        "codex",
+        "free"
+      ]
+    },
+    "general": {
+      "T1": [
+        "free",
+        "agy",
+        "codex"
+      ],
+      "T2": [
+        "agy",
+        "free",
+        "codex"
+      ],
+      "T3": [
+        "agy",
+        "codex",
+        "free"
+      ]
+    },
+    "creative": {
+      "T1": [
+        "agy",
+        "free",
+        "codex"
+      ],
+      "T2": [
+        "agy",
+        "free",
+        "codex"
+      ],
+      "T3": [
+        "agy",
+        "codex",
+        "free"
+      ]
+    }
   },
   "gemini_T3_when_google_login": {
     "model": "gemini-3.1-pro-preview"
@@ -135,13 +175,6 @@
       }
     ]
   },
-  "prefer_tier": {
-    "T3": [
-      "codex",
-      "agy",
-      "free"
-    ]
-  },
   "agy": {
     "T1": {
       "model": "gemini-3.8-flash-low"
@@ -152,5 +185,10 @@
     "T3": {
       "model": "gemini-3.1-pro-high"
     }
+  },
+  "budget_weight": {
+    "codex": 1,
+    "agy": 4,
+    "free": 6
   }
 }

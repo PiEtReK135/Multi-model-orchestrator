@@ -11,7 +11,8 @@ description: Set up SeniorRouter in the current project (.router/ config, ECC ru
    - test/lint/build commands (default: detected ones).
 2. Run from project root:
    `node "$HOME/.claude/router/router.mjs" init --profile <code|general|creative> [--stack a,b] [--confidential] [--test "<cmd>"] [--lint "<cmd>"] [--build "<cmd>"]`
-3. Do the `next` steps it prints: git init + first commit if needed; code: `graphify update .`; creative: `/graphify .`
-   (LLM extraction of docs/canon); then `graphify hook install`.
+3. Do the `next` steps it prints: git init + first commit if needed; then `node "$HOME/.claude/router/router.mjs" graph`
+   (AST graph of the code, no LLM; never run /graphify in Claude for docs) and `graphify hook install`. Big source documents (PDF/docx): `R digest <file> --focus ...` once,
+   so later work reads digests instead of the originals.
    Offer to fill .router/prompts/common.md and <kind>.md with the project conventions (short rules, English).
 4. Run `node "$HOME/.claude/router/router.mjs" doctor` and report in <= 6 lines (stack, mode, rules copied, graph, executors ready).

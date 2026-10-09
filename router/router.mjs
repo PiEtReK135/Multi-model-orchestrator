@@ -105,7 +105,8 @@ function scanSecrets({ dirs = [], files = [], text = '' }) {
 const TYPE_TIER = {
   lookup: 1, summarize: 1, triage: 1, format: 1, trivial: 1,
   implement: 2, test: 2, docs: 2, debug: 2, write: 2, draft: 2,
-  feature: 3, refactor: 3, 'hard-debug': 3, analysis: 3, 'long-write': 3, worldbuilding: 3,
+  analysis: 2, research: 2,
+  feature: 3, refactor: 3, 'hard-debug': 3, 'long-write': 3, worldbuilding: 3,
   architecture: 4, 'security-review': 4, arbitration: 4, 'canon-change': 4,
 };
 const REQUIRED = ['id', 'type', 'acceptance_criteria', 'files'];
@@ -124,22 +125,31 @@ function decide(card, cfg, mode, prov) {
 
   let t = TYPE_TIER[card.type] ?? 2;
   if (!(card.type in TYPE_TIER)) reasons.push(`unknown type ${card.type} -> T2`);
-  const d = card.difficulty ?? 0.5;
+  const d = card.difficulty ?? 0.5; const kind = taskKind(card, cfg);
   if (d >= 0.7) { t = Math.max(t, 3); reasons.push(`difficulty ${d} >= 0.7`); }
-  if ((card.files || []).length >= 4) { t = Math.max(t, 3); reasons.push('>= 4 files'); }
+  if (d <= 0.25 && t === 2 && !risky) { t = 1; reasons.push(`difficulty ${d} <= 0.25 -> T1`); }
+  if (kind === 'code' && t < 3) { // size only matters for code: many files / big files need a real agent
+    const lines = (card.files || []).reduce((n, f) => { try { return n + fs.readFileSync(path.join(ROOT, f), 'utf8').split('\n').length; } catch { return n; } }, 0);
+    if ((card.files || []).length >= 5 || lines > 1500) { t = 3; reasons.push(`code size: ${(card.files || []).length} files, ${lines} lines`); }
+  }
   if (risky && t < 4) { t = Math.max(t, 3); }
   if (card.classifier && card.classifier.confidence < 0.6 && t < 4) { t++; reasons.push('low classifier confidence: +1 tier'); }
+  const tBefore = t; t = calibrate(card, cfg, mode, t, risky, reasons);
+  const learnedDown = t < tBefore; // strong evidence may go below the mode floor
   if (card.min_tier) t = Math.max(t, tierNum(card.min_tier));
 
   if (t >= 4) return { tier: TIERS[Math.min(t, mode.t5 ? 5 : 4)], executor: 'claude', model: claudeModel(t), risky, reasons: [...reasons, `type ${card.type} needs Claude`] };
   // external production band of the mode
   const [lo, hi] = mode.production;
-  let band = Math.min(Math.max(t, lo), hi);
+  let band = Math.min(Math.max(t, learnedDown ? Math.min(lo, t) : lo), hi);
   if (t === 3 && hi < 3 && d >= (mode.t3_min_difficulty ?? 1)) band = 3;
   if (band !== t) reasons.push(`mode ${mode.name} band [T${lo},T${hi}] -> T${band}`);
-  const exec = pickExecutor(card, cfg, prov, band);
+  const exec = pickExecutor(card, cfg, prov, band, reasons);
   if (!exec) return { tier: `T${band}`, executor: 'claude', model: band <= 1 ? prov.claude.T1 : prov.claude.orchestrator, risky, reasons: [...reasons, 'no external executor available -> Claude'] };
-  return { tier: `T${band}`, executor: exec, model: prov[exec][`T${band}`].model, effort: prov[exec][`T${band}`].effort, risky, reasons };
+  let spec = prov[exec][`T${band}`];
+  // the frontier model is the exception: only after a T3 failure, for very hard tasks, or in senior mode
+  if (band === 3 && prov[exec].T3_hard && (card.fails?.T3 || d >= 0.9 || mode.name === 'senior')) { spec = prov[exec].T3_hard; reasons.push(`hard T3 -> ${spec.model}`); }
+  return { tier: `T${band}`, executor: exec, model: spec.model, effort: spec.effort, risky, reasons };
 }
 
 const CREATIVE_TYPES = ['write', 'draft', 'long-write', 'worldbuilding', 'canon-change'];
@@ -151,20 +161,70 @@ function taskKind(card, cfg) {
   return 'code';
 }
 
-function pickExecutor(card, cfg, prov, band) {
+function pickExecutor(card, cfg, prov, band, reasons = []) {
   const usage = readJSON(path.join(RDIR, 'usage.json'), { providers: {} });
-  const kind = { code: 'code', general: 'docs', creative: 'creative' }[taskKind(card, cfg)];
-  let order = (prov.prefer_tier?.[`T${band}`] || prov.prefer[kind] || ['codex', 'gemini'])
+  const pk = prov.prefer[taskKind(card, cfg)] || prov.prefer.code;
+  let order = (Array.isArray(pk) ? pk : (pk[`T${band}`] || pk.default || ['codex']))
     .filter(p => prov[p]?.[`T${band}`] && !(cfg.disabled_providers || []).includes(p) && (p !== 'free' || freeConfig(prov).count > 0));
   if (card.avoid_executor) order = [...order.filter(p => p !== card.avoid_executor), ...order.filter(p => p === card.avoid_executor)];
   const health = readJSON(HEALTH, {});
   const ok = order.filter(p => !(usage.providers[p]?.cooldown_until > now()) && !(health[p]?.ok === false && Date.parse(health[p].ts) > Date.now() - 6 * 36e5));
   if (!ok.length) return null;
-  // ponytail: naive 24h call-count balancing; replace with real quota telemetry if providers expose it
-  const day = Date.now() - 864e5;
-  const calls = p => (usage.providers[p]?.history || []).filter(ts => Date.parse(ts) > day).length;
-  if (ok.length > 1 && calls(ok[0]) > 2 * calls(ok[1]) + 5) return ok[1];
+  // subscription-aware balancing: 24h weighted tokens per provider (weight = relative capacity, e.g. agy has more room)
+  if (ok.length > 1 && !card.avoid_executor) {
+    const day = Date.now() - 864e5, w = prov.budget_weight || {}, ledger = readLines(LEDGER).filter(e => Date.parse(e.ts) > day);
+    const load = Object.fromEntries(ok.map(p => [p, ledger.filter(e => e.p === p).reduce((n, e) => n + e.t, 0) / (w[p] || 1)]));
+    const min = Math.min(...Object.values(load));
+    const pick = ok.find(p => load[p] <= 1.5 * min + 2e5) || ok[0];
+    if (pick !== ok[0]) reasons.push(`balance: ${ok[0]} 24h load high -> ${pick}`);
+    return pick;
+  }
   return ok[0];
+}
+
+// ---------- playbooks: lessons from failed reviews, injected into future prompts of that executor/kind ----------
+const PLAYBOOKS = path.join(HOME_DIR, 'playbooks.json');
+const normLesson = t => t.toLowerCase().replace(/[^a-z0-9ąćęłńóśźż]+/g, ' ').trim();
+function addLesson(executor, kind, text) {
+  if (!fs.existsSync(HOME_DIR) || !text?.trim()) return null;
+  const pb = readJSON(PLAYBOOKS, null) || readJSON(path.join(HOME_DIR, 'playbooks.default.json'), []); const k = normLesson(text);
+  const hit = pb.find(l => l.executor === executor && l.kind === kind && normLesson(l.text) === k);
+  if (hit) { hit.n++; hit.ts = now(); } else pb.push({ executor, kind, text: text.trim(), n: 1, ts: now() });
+  writeJSON(PLAYBOOKS, pb); return hit || pb.at(-1);
+}
+function lessonsFor(executor, kind, max = 8) { // most confirmed first; 'all' applies to every executor/kind
+  return (readJSON(PLAYBOOKS, null) || readJSON(path.join(HOME_DIR, 'playbooks.default.json'), [])).filter(l => (l.executor === executor || l.executor === 'all') && (l.kind === kind || l.kind === 'all'))
+    .sort((a, b) => b.n - a.n || (a.ts < b.ts ? 1 : -1)).slice(0, max).map(l => l.text);
+}
+
+// ---------- learning: global outcome ledger (all projects) -> tier calibration ----------
+const OUTCOMES = path.join(HOME_DIR, 'outcomes.jsonl');
+const LEDGER = path.join(HOME_DIR, 'ledger.jsonl');
+function readLines(p) { try { return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); } catch { return []; } }
+const appendLine = (p, o) => { if (fs.existsSync(HOME_DIR)) fs.appendFileSync(p, JSON.stringify(o) + '\n'); };
+function bucketStats(kind, type) { // first-try pass rate per tier for similar tasks
+  const st = {};
+  for (const o of readLines(OUTCOMES)) if (o.kind === kind && o.type === type) { const x = st[o.tier] ||= { n: 0, pass: 0 }; x.n++; if (o.verdict === 'pass' && o.try === 1) x.pass++; }
+  return st;
+}
+// ponytail: per (kind,type) first-try pass rates with fixed thresholds; a feature-based model when data grows (100s of tasks)
+function calibrate(card, cfg, mode, t, risky, reasons) {
+  const policy = cfg.learning ?? 'auto';
+  if (policy === 'off' || t >= 4) return t;
+  const st = bucketStats(taskKind(card, cfg), card.type);
+  const n = x => st[`T${x}`]?.n || 0, rate = x => n(x) ? st[`T${x}`].pass / n(x) : 0, pct = x => `${Math.round(100 * rate(x))}% of ${n(x)}`;
+  let nt = t, why = '';
+  if (t < 3 && n(t) >= 4 && rate(t) < 0.5) { nt = t + 1; why = `learned: T${t} first-try pass ${pct(t)} -> T${nt}`; }
+  else if (t > 1 && n(t - 1) >= 5 && rate(t - 1) >= 0.8) { nt = t - 1; why = `learned: T${t - 1} first-try pass ${pct(t - 1)} -> T${nt}`; }
+  else if (t > 1 && !risky && mode.name !== 'senior' && n(t) >= 5 && rate(t) >= 0.9 && n(t - 1) < 2) { nt = t - 1; why = `learned/explore: T${t} passes ${pct(t)}, trying T${nt}`; }
+  if (why) reasons.push(policy === 'auto' ? why : `${why} (proposal only, learning=${policy})`);
+  return policy === 'auto' ? nt : t;
+}
+function recordOutcome(card, cfg, verdict, tryAtTier) {
+  const at = (card.attempts || []).filter(x => x.tier === card.tier);
+  const tok = at.reduce((n, x) => n + (x.tokens?.input_tokens || 0) + (x.tokens?.output_tokens || 0), 0);
+  appendLine(OUTCOMES, { ts: now(), project: path.basename(ROOT), kind: taskKind(card, cfg), type: card.type, tier: card.tier, executor: card.executor,
+    model: card.model, difficulty: card.difficulty, files: (card.files || []).length, verdict, try: tryAtTier, tokens: tok });
 }
 
 // ---------- free pool: local LiteLLM proxy over official free API tiers ----------
@@ -329,15 +389,18 @@ function buildPrompt(card, wt) {
     card.feedback?.length ? `PREVIOUS ATTEMPT WAS REJECTED. Unmet criteria / reviewer notes:\n- ${card.feedback.at(-1).join('\n- ')}` : '',
     k.rules,
     guide ? `PROJECT GUIDELINES (from the project owner):\n${guide}` : '',
-    'Rules: do not edit files outside the allowed list; never read, create or print secrets/.env; do not commit.',
-    'Finish with a short summary: what changed, how each criterion is met (file:line or command output), anything left open.',
+    (l => l.length ? `LESSONS FROM PAST REVIEWS OF YOUR WORK (follow them):\n- ${l.join('\n- ')}` : '')(lessonsFor(card.executor, kind)),
+    'Rules: work only with the allowed files and the files named in CONTEXT (do not scan or list the repository); do not edit files outside the allowed list; never read, create or print secrets/.env; do not commit.',
+    'Finish with a summary of at most 120 words: what changed, how each criterion is met (file:line or command output), anything left open.',
   ].filter(Boolean).join('\n\n');
 }
 
+const CODEX_LEAN = ['apps', 'plugins', 'remote_plugin', 'multi_agent', 'goals', 'browser_use', 'browser_use_external', 'computer_use',
+  'image_generation', 'in_app_browser', 'tool_suggest', 'skill_search', 'mentions_v2'].flatMap(x => ['--disable', x]).concat(['-c', 'web_search=disabled']);
 function runExecutor(exec, model, effort, prompt, cwd, timeoutMin, readOnly = false) {
   const t0 = Date.now(); let r, tokens = {}, message = '';
   if (exec === 'codex') {
-    const a = ['exec', '--cd', cwd, '--skip-git-repo-check', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '-m', model, '--json'];
+    const a = ['exec', '--cd', cwd, '--skip-git-repo-check', '--sandbox', readOnly ? 'read-only' : 'workspace-write', '-m', model, '--json', ...CODEX_LEAN];
     if (effort) a.push('-c', `model_reasoning_effort="${effort}"`);
     // Windows: if the elevated sandbox helper is broken, use the unelevated one (still blocks writes outside the
     // worktree) for 24h, then try elevated again in case it was repaired.
@@ -381,6 +444,8 @@ function recordUsage(exec, res) {
   e.output_tokens += res.tokens.output_tokens ?? res.tokens.candidates ?? res.tokens.output ?? 0;
   if (res.limited) e.cooldown_until = new Date(Date.now() + 36e5).toISOString();
   writeJSON(p, u); setHealth(exec, res);
+  const t = res.tokens || {}; const inp = t.input_tokens ?? t.prompt ?? t.input ?? 0, cached = t.cached_input_tokens ?? t.cache_read_tokens ?? 0;
+  appendLine(LEDGER, { ts: now(), p: exec, t: Math.round(inp - 0.9 * cached + (t.output_tokens ?? t.output ?? 0)) });
 }
 function setHealth(exec, res) {
   if (!fs.existsSync(HOME_DIR)) return;
@@ -420,6 +485,11 @@ cmds.exec = a => {
   if (sh('git', ['rev-parse', '--verify', 'HEAD'], { shell: false }).status !== 0) die('project needs git with at least one commit (worktrees)');
   const branch = `router/${card.id}`; const wt = path.join(RDIR, 'wt', card.id);
   if (!fs.existsSync(wt)) git(['worktree', 'add', '-q', '-b', branch, wt, 'HEAD']);
+  if (!card.context && fs.existsSync(path.join(ROOT, 'graphify-out', 'graph.json'))) {
+    const q = sh('graphify', ['query', `${card.title || ''} ${(card.goal || '').slice(0, 200)}`.trim()], { cwd: ROOT, timeout: 6e4 });
+    const lines = (q.stdout || '').split('\n').filter(l => /^(NODE|EDGE)/.test(l)).slice(0, 40);
+    if (lines.length) { card.context = `[auto: graphify query]\n${lines.join('\n')}`; saveCard(card); }
+  }
   const prompt = buildPrompt(card, wt);
   // Secret gate: everything the executor can see = tracked files in the worktree + the prompt.
   const leaks = scanSecrets({ dirs: card.scanned_base === git(['rev-parse', 'HEAD']) ? [] : [wt], text: prompt, files: card.files || [] });
@@ -467,10 +537,12 @@ cmds.judge = a => {
 cmds.next = a => {
   // Deterministic retry/escalation policy. --verdict pass|fail [--notes "unmet 1; unmet 2"]
   const card = loadCard(a._[0]); const cfg = config(); const mode = loadMode(card.mode || cfg.mode);
-  if (a.verdict === 'pass') { card.status = 'accepted'; saveCard(card); log('verdict', { id: card.id, verdict: 'pass', tier: card.tier, executor: card.executor, attempts: card.attempts?.length || 0, type: card.type, difficulty: card.difficulty }); return out({ action: 'accept', cmd: `router accept ${card.id}` }); }
+  if (a.verdict === 'pass') { recordOutcome(card, cfg, 'pass', (card.fails?.[card.tier] || 0) + 1); card.status = 'accepted'; saveCard(card); log('verdict', { id: card.id, verdict: 'pass', tier: card.tier, executor: card.executor, attempts: card.attempts?.length || 0, type: card.type, difficulty: card.difficulty }); return out({ action: 'accept', cmd: `router accept ${card.id}` }); }
   const notes = String(a.notes || 'criteria not met').split(';').map(s => s.trim()).filter(Boolean);
   card.feedback = [...(card.feedback || []), notes];
   card.fails = { ...card.fails, [card.tier]: (card.fails?.[card.tier] || 0) + 1 };
+  if (!a.infra) recordOutcome(card, cfg, 'fail', card.fails[card.tier]); // --infra: provider outage, not a quality signal
+  if (a.lesson) addLesson(card.executor, taskKind(card, cfg), String(a.lesson));
   const atTier = (card.attempts || []).filter(x => x.tier === card.tier);
   const last = atTier.at(-1), prev = atTier.at(-2);
   const stuck = !!(last && prev && last.diff_hash === prev.diff_hash);
@@ -541,6 +613,91 @@ cmds.free = a => {
     cmds.free({ _: ['down'] }); ensureProxy(); // restart without them
   }
   out({ proxy: PROXY_URL, excluded_now: permanent.map(([k]) => k), ok: Object.keys(res).filter(k => res[k].text), failing: Object.fromEntries(Object.entries(res).filter(([, v]) => !v.text).map(([k, v]) => [k, (v.error || 'empty reply').slice(0, 160)])) });
+};
+
+function agyAsk(text, { dirs = [], model, minutes = 6 } = {}) {
+  const r = sh(agyBin(), ['-p', text, '--model', model, '--output-format', 'json', '--mode', 'plan', ...dirs.flatMap(d => ['--add-dir', d]), '--print-timeout', `${minutes}m`],
+    { timeout: (minutes + 1) * 6e4, shell: false, cwd: dirs[0] || os.tmpdir() });
+  try { const o = r.stdout; const j = JSON.parse(o.slice(o.indexOf('{'))); return { ok: j.status === 'SUCCESS' && !!j.response, text: j.response || '', tokens: j.usage || {}, error: j.response ? '' : `${j.status} ${JSON.stringify(j.denied_actions || [])}` }; }
+  catch { return { ok: false, text: '', tokens: {}, error: `${r.stdout}${r.stderr}`.slice(-300) || 'timeout' }; }
+}
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'note';
+function saveNote(sub, name, body) { const p = path.join(RDIR, sub, `${new Date().toISOString().slice(0, 10)}-${slug(name)}.md`); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); return path.relative(ROOT, p); }
+
+cmds.research = a => { // web research by Antigravity: answer + sources; Claude reads only this
+  const q = a._.join(' ').trim() || die('usage: router research "<question>" [--deep] [--words 250] [--files a,b]');
+  const prov = providers(); const model = a.deep ? prov.agy.T3.model : prov.agy.T2.model;
+  if (readJSON(path.join(RDIR, 'config.json'), {}).confidential) die('confidential project: research stays with Claude', 2);
+  const files = String(a.files || '').split(',').filter(Boolean).map(f => path.resolve(ROOT, f));
+  const leaks = scanSecrets({ text: q, files }); if (leaks.length) { out({ blocked: true, leaks }); process.exit(3); }
+  const r = agyAsk(`Research this question using web search${files.length ? ' and these files: ' + files.join(', ') : ''}. Answer in the language of the question, at most ${a.words || 250} words, as compact bullet points. Every fact or number gets its source URL (or file:section). Mark anything uncertain with [?]. Do not edit files.\n\nQUESTION: ${q}`,
+    { dirs: [...new Set(files.map(f => path.dirname(f)))], model });
+  if (fs.existsSync(RDIR)) recordUsage('agy', { ok: r.ok, limited: false, timedOut: false, tokens: r.tokens, message: r.text, tail: r.error });
+  if (!r.ok) { out({ ok: false, error: r.error, next: 'agy unavailable: fall back to WebSearch in a Haiku subagent' }); process.exit(1); }
+  const file = fs.existsSync(RDIR) ? saveNote('research', q, `# ${q}\n\n${r.text}\n`) : null;
+  out({ ok: true, model, saved: file, answer: r.text });
+};
+
+cmds.digest = a => { // big local documents (PDF, docx, md) -> compact digest by Antigravity
+  if (!a._.length) die('usage: router digest <file...> [--focus "what matters"] [--words 400] [--deep]');
+  if (readJSON(path.join(RDIR, 'config.json'), {}).confidential) die('confidential project: digest stays with Claude', 2);
+  const files = a._.map(f => path.resolve(ROOT, f)); for (const f of files) if (!fs.existsSync(f)) die(`no such file ${f}`);
+  const leaks = scanSecrets({ files: files.filter(f => !/\.(pdf|docx?|pptx?|xlsx?)$/i.test(f)) }); if (leaks.length) { out({ blocked: true, leaks }); process.exit(3); }
+  const prov = providers(); const model = a.deep ? prov.agy.T3.model : prov.agy.T2.model;
+  const r = agyAsk(`Read these files: ${files.join(', ')}. Write a digest of at most ${a.words || 400} words${a.focus ? ` focused on: ${a.focus}` : ''}: requirements, numbers with units, limits, deadlines and definitions, each with its location (file + section/page). No filler, no repetition of the question. Do not edit files.`,
+    { dirs: [...new Set(files.map(f => path.dirname(f)))], model });
+  if (fs.existsSync(RDIR)) recordUsage('agy', { ok: r.ok, limited: false, timedOut: false, tokens: r.tokens, message: r.text, tail: r.error });
+  if (!r.ok) { out({ ok: false, error: r.error }); process.exit(1); }
+  const file = fs.existsSync(RDIR) ? saveNote('digests', path.basename(files[0]), `# Digest: ${files.map(f => path.relative(ROOT, f)).join(', ')}\n\n${r.text}\n`) : null;
+  out({ ok: true, model, saved: file, digest: r.text });
+};
+
+cmds.learn = a => { // show calibration, or import outcomes from another project's .router
+  if (a.import) {
+    const R = path.resolve(a.import); const evs = readLines(path.join(R, 'decisions.jsonl')); let n = 0;
+    const known = new Set(readLines(OUTCOMES).map(o => `${o.project}|${o.ts}`));
+    for (const e of evs.filter(e => e.event === 'verdict')) {
+      const c = readJSON(path.join(R, 'tasks', `${e.id}.json`), {}); const proj = path.basename(path.dirname(R));
+      if (known.has(`${proj}|${e.ts}`)) continue;
+      const kind = c.kind || ({ creative: 'creative', general: 'general' }[readJSON(path.join(R, 'config.json'), {}).profile] || 'code');
+      appendLine(OUTCOMES, { ts: e.ts, project: proj, kind, type: e.type || c.type, tier: e.tier, executor: e.executor, model: c.model, difficulty: e.difficulty ?? c.difficulty,
+        files: (c.files || []).length, verdict: e.verdict, try: e.verdict === 'pass' ? 1 + (c.fails?.[e.tier] || 0) : 1, tokens: 0, imported: true }); n++;
+    }
+    return out({ imported: n, from: R });
+  }
+  const st = {}; for (const o of readLines(OUTCOMES)) { const k = `${o.kind}|${o.type}|${o.tier}`; const x = st[k] ||= { n: 0, first_try_pass: 0, tokens: 0 }; x.n++; if (o.verdict === 'pass' && o.try === 1) x.first_try_pass++; x.tokens += o.tokens || 0; }
+  out({ outcomes: readLines(OUTCOMES).length, by_kind_type_tier: st, policy: 'down 1 tier when the lower tier passes >=80% of >=5 similar tasks first try; up 1 tier when the current tier passes <50% of >=4; config.learning = auto|propose|off' });
+};
+
+cmds.lesson = a => { // lesson add "<text>" --executor free|agy|codex|all --kind code|general|creative|all | lesson list | lesson rm <n>
+  const sub = a._[0] || 'list';
+  if (sub === 'add') return out(addLesson(a.executor || 'all', a.kind || 'all', a._.slice(1).join(' ')) || die('nothing to add'));
+  const pb = readJSON(PLAYBOOKS, null) || readJSON(path.join(HOME_DIR, 'playbooks.default.json'), []);
+  if (sub === 'rm') { const i = Number(a._[1]); if (!(i >= 0 && i < pb.length)) die('index out of range'); const [r] = pb.splice(i, 1); writeJSON(PLAYBOOKS, pb); return out({ removed: r }); }
+  out(pb.map((l, i) => `${i}. [${l.executor}/${l.kind} x${l.n}] ${l.text}`).join('\n') || '(no lessons yet)');
+};
+
+function ensureGraphIgnore() { // router internals (cards, diffs, logs) are not project knowledge
+  const p = path.join(ROOT, '.graphifyignore'); const t = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+  if (!t.includes('.router/')) fs.appendFileSync(p, `${t && !t.endsWith('\n') ? '\n' : ''}.router/\n.claude/\n`);
+}
+cmds.graph = a => { // AST graph of all code (no LLM). --semantic: experimental docs extraction through the free pool.
+  ensureGraphIgnore();
+  const cfg = config();
+  if (!a.semantic) {
+    const r = sh('graphify', ['update', '.'], { cwd: ROOT, timeout: 30 * 6e4 });
+    // ponytail: docs go through digests (agy); free-tier semantic extraction fails on PDF page images / TPM limits
+    return out({ mode: 'ast', ok: r.status === 0, tail: `${r.stdout}${r.stderr}`.slice(-300),
+      next: cfg.profile === 'code' ? 'graphify hook install' : 'big documents: router digest <files> --focus "..." (Antigravity); optional: router graph --semantic' });
+  }
+  if (cfg.confidential) die('confidential project: semantic extraction would leave the machine; use code AST or /graphify in Claude', 2);
+  const leaks = scanSecrets({ dirs: [ROOT] }).filter(l => !/[\\/](\.git|\.router|graphify-out|node_modules)[\\/]/.test(l.file));
+  if (leaks.length) { out({ blocked: true, leaks: leaks.slice(0, 10), next: 'move secrets out of the project or add a .graphifyignore' }); process.exit(3); }
+  const p = ensureProxy(); if (!p.ok) die(`free pool unavailable: ${p.reason}`);
+  const model = a.model || 'free-t2';
+  const r = sh('graphify', ['extract', '.', '--backend', 'openai'], { cwd: ROOT, timeout: 90 * 6e4, shell: false,
+    env: { ...process.env, OPENAI_BASE_URL: `${p.url}/v1`, OPENAI_API_KEY: p.key, OPENAI_MODEL: model } });
+  out({ mode: 'semantic', backend: `openai -> LiteLLM ${model}`, ok: r.status === 0, tail: `${r.stdout}${r.stderr}`.slice(-600), next: 'graphify hook install (keeps the AST part fresh on commit)' });
 };
 
 cmds.prompt = a => out(buildPrompt(loadCard(a._[0]), '<worktree>')); // preview what the executor will get
@@ -671,7 +828,7 @@ Write short, concrete rules in English: conventions, style, terms, things to avo
   const isGit = sh('git', ['rev-parse', '--is-inside-work-tree'], { shell: false }).status === 0;
   out({ config: cfg, rules_copied: copied.length, git: isGit, next: [
     isGit ? null : 'git init && git add -A && git commit -m init   (worktrees need a commit)',
-    profile === 'code' ? 'graphify update .   (AST graph, no LLM)  then  graphify hook install' : '/graphify .   (LLM extraction of docs)  then  graphify hook install',
+    profile === 'code' ? 'router graph   (AST graph, no LLM)  then  graphify hook install' : 'router graph (code AST) + router digest <big docs> --focus ...  then  graphify hook install',
     'optional: write project guidelines in .router/prompts/*.md',
     cfg.verify.test ? null : 'set verify.test/lint/build in .router/config.json',
   ].filter(Boolean) });
@@ -686,6 +843,8 @@ if (!cmd || !cmds[cmd]) {
   next <id> --verdict pass|fail [--notes "a; b"]   accept <id>   reject <id>
   scan <paths...> [--text s]   mode [eco|normal|senior|creative]   usage   stats   doctor [--probe]
   free status|up|check|down   (LiteLLM proxy over free API tiers)
+  graph [--semantic --model <free model>]   research "<question>" [--deep]   digest <file...> [--focus s]   learn [--import <project>/.router]
+  lesson add "<text>" --executor x --kind k | lesson list | lesson rm <n>   (next ... --lesson "<text>")
   install [--dry-run] [--force]   uninstall [--dry-run]`);
   process.exit(cmd ? 1 : 0);
 }

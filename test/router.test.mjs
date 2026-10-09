@@ -38,7 +38,7 @@ test('routing: tiers, secrets, risk, classifier flag', () => {
   let r = json(run('route', 'c1'));
   assert.equal(r.tier, 'T2'); assert.equal(r.executor, 'codex'); assert.equal(r.judge.by, 'claude');
 
-  card({ id: 'c2', type: 'implement', difficulty: 0.4, files: ['a.py', 'b.py', 'c.py', 'd.py'], acceptance_criteria: ['x'] });
+  card({ id: 'c2', type: 'implement', difficulty: 0.4, files: ['a.py', 'b.py', 'c.py', 'd.py', 'e.py'], acceptance_criteria: ['x'] });
   assert.equal(json(run('route', 'c2')).tier, 'T3');
 
   card({ id: 'c3', type: 'implement', difficulty: 0.3, files: ['.env'], acceptance_criteria: ['x'] });
@@ -110,6 +110,49 @@ test('executor prompt: kind-specific role and project guidelines from .router/pr
   const code = run('prompt', 'p1').stdout, gen = run('prompt', 'p2').stdout;
   assert.match(code, /senior software engineer/); assert.match(code, /Use type hints everywhere/); assert.doesNotMatch(code, /ignored|Polish/);
   assert.match(gen, /senior analyst/); assert.match(gen, /Write in Polish/); assert.doesNotMatch(gen, /type hints/);
+});
+
+test('economy: hard-T3 model only when needed, per-kind order, token balancing, learned calibration', () => {
+  const home = path.join(dir, '.home'); fs.mkdirSync(home, { recursive: true });
+  const p = path.join(dir, '.router', 'providers.json'); const prov = JSON.parse(fs.readFileSync(p, 'utf8'));
+  prov.codex.T3 = { model: 'sol', effort: 'high' }; prov.codex.T3_hard = { model: 'astra', effort: 'high' };
+  prov.agy = { T1: { model: 'g1' }, T2: { model: 'g2' }, T3: { model: 'g3' } };
+  prov.prefer = { code: { T1: ['codex'], T2: ['codex', 'agy'], T3: ['codex', 'agy'] }, general: { T1: ['agy'], T2: ['agy', 'codex'], T3: ['agy', 'codex'] }, creative: ['agy'] };
+  prov.budget_weight = { codex: 1, agy: 3 }; delete prov.free; delete prov.free_pool;
+  fs.writeFileSync(p, JSON.stringify(prov));
+  card({ id: 'h1', type: 'feature', difficulty: 0.6, files: ['a.py'], acceptance_criteria: ['x'] });
+  assert.equal(json(run('route', 'h1')).model, 'sol');
+  card({ id: 'h2', type: 'feature', difficulty: 0.95, files: ['a.py'], acceptance_criteria: ['x'] });
+  assert.equal(json(run('route', 'h2')).model, 'astra');
+  card({ id: 'g1', type: 'analysis', difficulty: 0.5, files: ['r.md'], acceptance_criteria: ['x'] });
+  const g = json(run('route', 'g1')); assert.equal(g.tier, 'T2'); assert.equal(g.executor, 'agy');
+  // codex used heavily in the last 24h -> T2 code goes to agy
+  fs.writeFileSync(path.join(home, 'ledger.jsonl'), JSON.stringify({ ts: new Date().toISOString(), p: 'codex', t: 900000 }) + '\n');
+  card({ id: 'b1', type: 'implement', difficulty: 0.5, files: ['a.py'], acceptance_criteria: ['x'] });
+  const b = json(run('route', 'b1')); assert.equal(b.executor, 'agy'); assert.ok(b.reasons.some(r => r.startsWith('balance')));
+  fs.rmSync(path.join(home, 'ledger.jsonl'));
+  // learned: T1 passed 5/5 similar general analyses first try -> route down; T2 code implement failing -> route up
+  const o = (tier, verdict, kind, type) => JSON.stringify({ ts: 't', kind, type, tier, verdict, try: 1 });
+  fs.writeFileSync(path.join(home, 'outcomes.jsonl'), [...Array(5)].map(() => o('T1', 'pass', 'general', 'analysis'))
+    .concat([...Array(4)].map(() => o('T2', 'fail', 'code', 'implement'))).join('\n') + '\n');
+  const down = json(run('route', 'g1')); assert.equal(down.tier, 'T1'); assert.ok(down.reasons.some(r => r.startsWith('learned')));
+  const up = json(run('route', 'b1')); assert.equal(up.tier, 'T3');
+  const cfgP = path.join(dir, '.router', 'config.json'); const cfg = JSON.parse(fs.readFileSync(cfgP, 'utf8'));
+  fs.writeFileSync(cfgP, JSON.stringify({ ...cfg, learning: 'propose' }));
+  const prop = json(run('route', 'g1')); assert.equal(prop.tier, 'T2'); assert.ok(prop.reasons.some(r => r.includes('proposal only')));
+  fs.writeFileSync(cfgP, JSON.stringify(cfg)); fs.rmSync(path.join(home, 'outcomes.jsonl'));
+});
+
+test('playbooks: lessons are deduplicated, ranked and injected only for that executor/kind', () => {
+  run('lesson', 'add', 'Append new tests at the end of the class.', '--executor', 'codex', '--kind', 'code');
+  run('lesson', 'add', 'append new tests at the END of the class', '--executor', 'codex', '--kind', 'code'); // same lesson -> n=2
+  run('lesson', 'add', 'Every number needs a unit.', '--executor', 'all', '--kind', 'general');
+  assert.match(run('lesson', 'list').stdout, /codex\/code x2/);
+  card({ id: 'l1', type: 'implement', executor: 'codex', files: ['a.py'], acceptance_criteria: ['x'] });
+  card({ id: 'l2', type: 'analysis', executor: 'agy', files: ['r.md'], acceptance_criteria: ['x'] });
+  const p1 = run('prompt', 'l1').stdout, p2 = run('prompt', 'l2').stdout;
+  assert.match(p1, /LESSONS FROM PAST REVIEWS[\s\S]*end of the class/); assert.doesNotMatch(p1, /unit/);
+  assert.match(p2, /Every number needs a unit/); assert.doesNotMatch(p2, /end of the class/);
 });
 
 test('secret scanner blocks a key in text', () => {
